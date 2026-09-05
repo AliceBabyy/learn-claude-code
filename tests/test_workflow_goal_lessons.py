@@ -151,7 +151,7 @@ def test_workflow_tool_adapter_uses_registry_and_returns_json(
         )
     )
 
-    assert workflow.WORKFLOW_TOOL["input_schema"]["required"] == ["name"]
+    assert workflow.WORKFLOW_TOOL["parameters"]["required"] == ["name"]
     assert result["launched"]["workflowName"] == "review-changes"
     assert result["task"]["status"] == "completed"
     assert result["task"]["taskType"] == "local_workflow"
@@ -308,7 +308,7 @@ def test_workflow_tool_extends_the_integrated_host_pool() -> None:
     )
     host = types.SimpleNamespace(
         assemble_tool_pool=lambda: (
-            [{"name": "bash", "input_schema": {}}],
+            [{"type": "function", "name": "bash", "parameters": {}}],
             {"bash": lambda **_: "ok"},
         )
     )
@@ -320,7 +320,7 @@ def test_workflow_tool_extends_the_integrated_host_pool() -> None:
     assert handlers["Workflow"] is workflow.run_workflow_sync
 
 
-def test_anthropic_runner_parses_json_and_records_real_usage() -> None:
+def test_openai_runner_parses_json_and_records_real_usage() -> None:
     workflow = load_lesson(
         "workflow_real_runner_test", ROOT / "s16_workflow_runtime" / "code.py"
     )
@@ -329,16 +329,14 @@ def test_anthropic_runner_parses_json_and_records_real_usage() -> None:
     def create(**kwargs):
         calls.append(kwargs)
         return types.SimpleNamespace(
-            content=[types.SimpleNamespace(
-                type="text", text='```json\n{"ok": true}\n```'
-            )],
+            output_text='```json\n{"ok": true}\n```',
             usage=types.SimpleNamespace(input_tokens=11, output_tokens=7),
         )
 
     client = types.SimpleNamespace(
-        messages=types.SimpleNamespace(create=create)
+        responses=types.SimpleNamespace(create=create)
     )
-    runner = workflow.AnthropicAgentRunner(client, "deepseek-v4-flash")
+    runner = workflow.OpenAIAgentRunner(client, "deepseek-v4-flash")
 
     result = runner.run(
         "Check the supplied change.",
@@ -365,20 +363,18 @@ def test_real_runner_output_retries_once_after_invalid_json(
     )
     responses = iter([
         types.SimpleNamespace(
-            content=[types.SimpleNamespace(type="text", text="not json")],
+            output_text="not json",
             usage=types.SimpleNamespace(input_tokens=3, output_tokens=2),
         ),
         types.SimpleNamespace(
-            content=[types.SimpleNamespace(
-                type="text", text='Result:\n```json\n{"ok": true}\n```\nDone.'
-            )],
+            output_text='Result:\n```json\n{"ok": true}\n```\nDone.',
             usage=types.SimpleNamespace(input_tokens=4, output_tokens=3),
         ),
     ])
     client = types.SimpleNamespace(
-        messages=types.SimpleNamespace(create=lambda **_kwargs: next(responses))
+        responses=types.SimpleNamespace(create=lambda **_kwargs: next(responses))
     )
-    runner = workflow.AnthropicAgentRunner(client, "test-model")
+    runner = workflow.OpenAIAgentRunner(client, "test-model")
     journal = workflow.WorkflowJournal(
         "wf_json-retry_0001", resume=False, store=tmp_path
     )
@@ -419,7 +415,7 @@ def test_install_workflow_tool_selects_the_host_api_runner() -> None:
     workflow.install_workflow_tool(host)
     runner = workflow.RUNNER_FACTORY()
 
-    assert isinstance(runner, workflow.AnthropicAgentRunner)
+    assert isinstance(runner, workflow.OpenAIAgentRunner)
     assert runner.client is client
     assert runner.model == "deepseek-v4-flash"
 
@@ -487,7 +483,7 @@ def test_workflow_tool_adapter_rejects_model_supplied_code() -> None:
     workflow = load_lesson(
         "workflow_schema_test", ROOT / "s16_workflow_runtime" / "code.py"
     )
-    properties = workflow.WORKFLOW_TOOL["input_schema"]["properties"]
+    properties = workflow.WORKFLOW_TOOL["parameters"]["properties"]
 
     assert set(properties) == {"name", "args", "resume_from_run_id"}
     assert "description" not in properties

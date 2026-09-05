@@ -33,21 +33,20 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL") or None)
+MODEL = os.getenv("OPENAI_MODEL_ID")
+if not MODEL:
+    raise RuntimeError("缺少 OPENAI_MODEL_ID，请在项目根目录的 .env 中配置模型名称")
 
 SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
-    "Use schedule_cron for work that should start at a future local time."
+    f"你是位于 {WORKDIR} 的编程智能体。使用工具解决任务。"
+    "需要在未来本地时间启动的工作使用 schedule_cron。"
 )
 
 
@@ -61,14 +60,16 @@ def run_bash(command: str) -> str:
             cwd=WORKDIR,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         output = (result.stdout + result.stderr).strip()
         if result.returncode != 0:
-            return f"Error: command exited with status {result.returncode}\n{output}"
-        return output[:50000] if output else "(no output)"
+            return f"错误：命令以状态码 {result.returncode} 退出\n{output}"
+        return output[:50000] if output else "（没有输出）"
     except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+        return "错误：执行超时（120 秒）"
 
 
 def run_read(path: str, limit: int | None = None) -> str:
@@ -79,7 +80,7 @@ def run_read(path: str, limit: int | None = None) -> str:
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
     except Exception as error:
-        return f"Error: {error}"
+        return f"错误：{error}"
 
 
 def run_write(path: str, content: str) -> str:
@@ -87,9 +88,9 @@ def run_write(path: str, content: str) -> str:
         file_path = (WORKDIR / path).resolve()
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"已向 {path} 写入 {len(content)} 字节"
     except Exception as error:
-        return f"Error: {error}"
+        return f"错误：{error}"
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
@@ -97,11 +98,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         file_path = (WORKDIR / path).resolve()
         text = file_path.read_text()
         if old_text not in text:
-            return f"Error: text not found in {path}"
+            return f"错误：在 {path} 中未找到指定文本"
         file_path.write_text(text.replace(old_text, new_text, 1))
-        return f"Edited {path}"
+        return f"已编辑 {path}"
     except Exception as error:
-        return f"Error: {error}"
+        return f"错误：{error}"
 
 
 def run_glob(pattern: str) -> str:
@@ -111,36 +112,36 @@ def run_glob(pattern: str) -> str:
             for match in glob.glob(pattern, root_dir=WORKDIR)
             if (WORKDIR / match).resolve().is_relative_to(WORKDIR)
         ]
-        return "\n".join(matches) if matches else "(no matches)"
+        return "\n".join(matches) if matches else "（没有匹配项）"
     except Exception as error:
-        return f"Error: {error}"
+        return f"错误：{error}"
 
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "bash", "description": "执行一条 Shell 命令。",
+     "parameters": {"type": "object",
                       "properties": {"command": {"type": "string"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
+                      "required": ["command"], "additionalProperties": False}},
+    {"type": "function", "name": "read_file", "description": "读取文件内容。",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
+                      "required": ["path"], "additionalProperties": False}},
+    {"type": "function", "name": "write_file", "description": "将内容写入文件。",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "content"], "additionalProperties": False}},
+    {"type": "function", "name": "edit_file", "description": "精确替换文件中首次出现的指定文本。",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "old_text", "new_text"], "additionalProperties": False}},
+    {"type": "function", "name": "glob", "description": "查找与 glob 模式匹配的文件。",
+     "parameters": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
-                      "required": ["pattern"]}},
+                      "required": ["pattern"], "additionalProperties": False}},
 ]
 
 TOOL_HANDLERS = {
@@ -173,67 +174,61 @@ DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
-def request_permission(block, reason: str) -> str | None:
+def request_permission(tool_name: str, arguments: dict, reason: str) -> str | None:
     if threading.current_thread() is not threading.main_thread():
-        return "Permission denied: scheduled turns cannot request interactive approval"
+        return "权限拒绝：定时任务轮次不能请求交互式批准"
 
     print(f"\n\033[33m[permission] {reason}\033[0m")
-    print(f"   Tool: {block.name}({block.input})")
+    print(f"   工具：{tool_name}({arguments})")
     choice = input("   Allow? [y/N] ").strip().lower()
     if choice not in ("y", "yes"):
-        return "Permission denied by user"
+        return "权限拒绝：用户未授权"
     return None
 
 
-def permission_hook(block):
-    if block.name == "bash":
-        command = block.input.get("command", "")
+def permission_hook(tool_name: str, arguments: dict):
+    if tool_name == "bash":
+        command = arguments.get("command", "")
         for pattern in DENY_LIST:
             if pattern in command:
                 print(f"\n\033[31m[blocked] '{pattern}'\033[0m")
-                return "Permission denied by deny list"
+                return "权限拒绝：命令命中禁止列表"
         if any(keyword in command for keyword in DESTRUCTIVE):
-            return request_permission(block, "Potentially destructive command")
+            return request_permission(tool_name, arguments, "可能具有破坏性的命令")
 
-    if block.name in ("read_file", "write_file", "edit_file"):
-        path = block.input.get("path", "")
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        path = arguments.get("path", "")
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
-            return request_permission(block, "Access outside workspace")
+            return request_permission(tool_name, arguments, "正在访问工作区外部")
     return None
 
 
-def log_hook(block):
-    preview = str(list(block.input.values())[:2])[:60]
-    print(f"\033[90m[HOOK] {block.name}({preview})\033[0m")
+def log_hook(tool_name: str, arguments: dict):
+    preview = str(list(arguments.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {tool_name}({preview})\033[0m")
     return None
 
 
-def large_output_hook(block, output):
+def large_output_hook(tool_name: str, arguments: dict, output):
     if len(str(output)) > 100000:
         print(
-            f"\033[33m[HOOK] Large output from {block.name}: "
+            f"\033[33m[HOOK] {tool_name} 输出过大："
             f"{len(str(output))} chars\033[0m"
         )
     return None
 
 
 def context_inject_hook(query: str):
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    print(f"\033[90m[HOOK] UserPromptSubmit：当前工作目录为 {WORKDIR}\033[0m")
     return None
 
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for item in messages
+        if (item.get("type") if isinstance(item, dict) else getattr(item, "type", None)) == "function_call"
     )
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    print(f"\033[90m[HOOK] Stop：本次会话调用了 {tool_count} 次工具\033[0m")
     return None
 
 
@@ -573,21 +568,21 @@ def run_cancel_cron(job_id: str) -> str:
 
 
 TOOLS.extend([
-    {"name": "schedule_cron",
-     "description": "Schedule a prompt with a 5-field cron expression.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "schedule_cron",
+     "description": "使用5字段Cron表达式安排提示词任务。",
+     "parameters": {"type": "object",
                       "properties": {
                           "cron": {"type": "string"},
                           "prompt": {"type": "string"},
                           "recurring": {"type": "boolean"},
                           "durable": {"type": "boolean"}},
-                      "required": ["cron", "prompt"]}},
-    {"name": "list_crons", "description": "List scheduled cron jobs.",
-     "input_schema": {"type": "object", "properties": {}, "required": []}},
-    {"name": "cancel_cron", "description": "Cancel a cron job by ID.",
-     "input_schema": {"type": "object",
+                      "required": ["cron", "prompt"], "additionalProperties": False}},
+    {"type": "function", "name": "list_crons", "description": "列出已安排的Cron任务。",
+     "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
+    {"type": "function", "name": "cancel_cron", "description": "按ID取消Cron任务。",
+     "parameters": {"type": "object",
                       "properties": {"job_id": {"type": "string"}},
-                      "required": ["job_id"]}},
+                      "required": ["job_id"], "additionalProperties": False}},
 ])
 
 TOOL_HANDLERS.update({
@@ -597,17 +592,17 @@ TOOL_HANDLERS.update({
 })
 
 
-def execute_tool(block) -> str:
-    blocked = trigger_hooks("PreToolUse", block)
+def execute_tool(tool_name: str, arguments: dict) -> str:
+    blocked = trigger_hooks("PreToolUse", tool_name, arguments)
     if blocked is not None:
         return str(blocked)
 
-    handler = TOOL_HANDLERS.get(block.name)
+    handler = TOOL_HANDLERS.get(tool_name)
     try:
-        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+        output = handler(**arguments) if handler else f"错误：未知工具 {tool_name}"
     except Exception as error:
-        output = f"Error: {error}"
-    trigger_hooks("PostToolUse", block, output)
+        output = f"错误：{error}"
+    trigger_hooks("PostToolUse", tool_name, arguments, output)
     return str(output)
 
 
@@ -636,12 +631,12 @@ def agent_loop(messages: list, context: dict | None = None):
     waiting_for_ack = list(fired)
     while True:
         try:
-            response = client.messages.create(
+            response = client.responses.create(
                 model=MODEL,
-                system=SYSTEM,
-                messages=messages,
+                instructions=SYSTEM,
+                input=messages,
                 tools=TOOLS,
-                max_tokens=8000,
+                max_output_tokens=8000,
             )
         except Exception as error:
             if waiting_for_ack:
@@ -650,7 +645,7 @@ def agent_loop(messages: list, context: dict | None = None):
             print(f"  [error] {type(error).__name__}: {error}")
             return context
 
-        messages.append({"role": "assistant", "content": response.content})
+        messages.extend(response.output)
         if waiting_for_ack:
             try:
                 acknowledge_cron_jobs(waiting_for_ack)
@@ -659,7 +654,7 @@ def agent_loop(messages: list, context: dict | None = None):
             waiting_for_ack = []
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
             force = trigger_hooks("Stop", messages)
@@ -668,30 +663,26 @@ def agent_loop(messages: list, context: dict | None = None):
                 continue
             return context
 
-        results = []
-        for block in tool_calls:
-            output = execute_tool(block)
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+        for tool_call in tool_calls:
+            arguments = json.loads(tool_call.arguments)
+            output = execute_tool(tool_call.name, arguments)
+            messages.append({
+                "type": "function_call_output",
+                "call_id": tool_call.call_id,
+                "output": output,
             })
-        messages.append({"role": "user", "content": results})
 
 
 def print_latest_assistant_text(messages: list):
-    for message in reversed(messages):
-        if message.get("role") != "assistant":
+    for item in reversed(messages):
+        item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+        if item_type != "message":
             continue
-        content = message.get("content", "")
-        if isinstance(content, str):
-            print(content)
-        else:
-            for block in content:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
-                elif isinstance(block, dict) and block.get("type") == "text":
-                    print(block.get("text", ""))
+        content = item.get("content", []) if isinstance(item, dict) else getattr(item, "content", [])
+        for part in content:
+            part_type = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            if part_type == "output_text":
+                print(part.get("text", "") if isinstance(part, dict) else part.text)
         return
 
 
@@ -752,8 +743,8 @@ def stop_runtime_threads():
 
 
 if __name__ == "__main__":
-    print("s12: Cron Scheduler - run prompts on a local schedule")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("s12：Cron调度器 - 按本地时间运行提示词任务")
+    print("输入问题后按回车发送，输入 q 或 exit 退出。\n")
     start_runtime_threads()
     try:
         while True:

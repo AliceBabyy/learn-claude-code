@@ -55,9 +55,15 @@ _shell_process_lock = threading.RLock()
 
 def _stop_process_group(process: subprocess.Popen):
     """Stop processes that remain in the command's original process group."""
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+    signals = [signal.SIGTERM]
+    if hasattr(signal, "SIGKILL"):
+        signals.append(signal.SIGKILL)
+    for sig in signals:
         try:
-            os.killpg(process.pid, sig)
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, sig)
+            elif process.poll() is None:
+                process.terminate()
         except (ProcessLookupError, OSError):
             return
         time.sleep(0.05)
@@ -167,32 +173,32 @@ def run_glob(pattern: str) -> str:
 
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "bash", "description": "执行一条 Shell 命令。",
+     "parameters": {"type": "object",
                       "properties": {
                           "command": {"type": "string"},
                           "run_in_background": {"type": "boolean"}},
-                      "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
+                      "required": ["command"], "additionalProperties": False}},
+    {"type": "function", "name": "read_file", "description": "读取文件内容。",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
-                      "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
+                      "required": ["path"], "additionalProperties": False}},
+    {"type": "function", "name": "write_file", "description": "将内容写入文件。",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
-                      "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "content"], "additionalProperties": False}},
+    {"type": "function", "name": "edit_file", "description": "精确替换文件中首次出现的指定文本。",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
-                      "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object",
+                      "required": ["path", "old_text", "new_text"], "additionalProperties": False}},
+    {"type": "function", "name": "glob", "description": "查找与 glob 模式匹配的文件。",
+     "parameters": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
-                      "required": ["pattern"]}},
+                      "required": ["pattern"], "additionalProperties": False}},
 ]
 
 TOOL_HANDLERS = {
@@ -225,41 +231,41 @@ DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
-def permission_hook(block):
-    if block.name == "bash":
-        command = block.input.get("command", "")
+def permission_hook(tool_name: str, arguments: dict):
+    if tool_name == "bash":
+        command = arguments.get("command", "")
         for pattern in DENY_LIST:
             if pattern in command:
                 print(f"\n\033[31m[blocked] '{pattern}'\033[0m")
-                return "Permission denied by deny list"
+                return "权限拒绝：命令命中禁止列表"
         if any(keyword in command for keyword in DESTRUCTIVE):
             print("\n\033[33m[permission] Potentially destructive command\033[0m")
-            print(f"   Tool: {block.name}({block.input})")
+            print(f"   工具：{tool_name}({arguments})")
             choice = input("   Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
-                return "Permission denied by user"
+                return "权限拒绝：用户未授权"
 
-    if block.name in ("read_file", "write_file", "edit_file"):
-        path = block.input.get("path", "")
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        path = arguments.get("path", "")
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
             print("\n\033[33m[permission] Access outside workspace\033[0m")
-            print(f"   Tool: {block.name}({block.input})")
+            print(f"   工具：{tool_name}({arguments})")
             choice = input("   Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
-                return "Permission denied by user"
+                return "权限拒绝：用户未授权"
     return None
 
 
-def log_hook(block):
-    preview = str(list(block.input.values())[:2])[:60]
-    print(f"\033[90m[HOOK] {block.name}({preview})\033[0m")
+def log_hook(tool_name: str, arguments: dict):
+    preview = str(list(arguments.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {tool_name}({preview})\033[0m")
     return None
 
 
-def large_output_hook(block, output):
+def large_output_hook(tool_name: str, arguments: dict, output):
     if len(str(output)) > 100000:
         print(
-            f"\033[33m[HOOK] Large output from {block.name}: "
+            f"\033[33m[HOOK] {tool_name} 输出过大："
             f"{len(str(output))} chars\033[0m"
         )
     return None
@@ -272,14 +278,8 @@ def context_inject_hook(query: str):
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for item in messages
+        if (item.get("type") if isinstance(item, dict) else getattr(item, "type", None)) == "function_call"
     )
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
@@ -292,12 +292,12 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 
-def call_tool(block) -> str:
-    handler = TOOL_HANDLERS.get(block.name)
+def call_tool(tool_name: str, arguments: dict) -> str:
+    handler = TOOL_HANDLERS.get(tool_name)
     try:
-        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+        output = handler(**arguments) if handler else f"错误：未知工具 {tool_name}"
     except Exception as error:
-        output = f"Error: {error}"
+        output = f"错误：{error}"
     return str(output)
 
 
@@ -311,18 +311,18 @@ class BackgroundManager:
         self._counter = 0
         self._lock = threading.Lock()
 
-    def start(self, block) -> str:
-        if block.name != "bash":
-            raise ValueError("Only Bash commands can run in the background")
-        command = block.input.get("command")
+    def start(self, tool_name: str, arguments: dict, call_id: str) -> str:
+        if tool_name != "bash":
+            raise ValueError("只有 Bash 命令可以在后台运行")
+        command = arguments.get("command")
         if not isinstance(command, str) or not command.strip():
-            raise ValueError("Bash command cannot be empty")
+            raise ValueError("Bash 命令不能为空")
 
         with self._lock:
             self._counter += 1
             task_id = f"bg_{self._counter:04d}"
             self.tasks[task_id] = {
-                "tool_use_id": block.id,
+                "call_id": call_id,
                 "command": command,
                 "status": "running",
             }
@@ -347,7 +347,7 @@ class BackgroundManager:
             result = _format_bash_result(output, exit_code)
             status = "completed" if exit_code == 0 else "failed"
         except Exception as error:
-            result = f"Error: {type(error).__name__}: {error}"
+            result = f"错误：{type(error).__name__}: {error}"
             status = "failed"
 
         with self._lock:
@@ -394,8 +394,8 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
     )
 
 
-def start_background_task(block) -> str:
-    return BACKGROUND.start(block)
+def start_background_task(tool_name: str, arguments: dict, call_id: str) -> str:
+    return BACKGROUND.start(tool_name, arguments, call_id)
 
 
 def collect_background_results() -> list[str]:
@@ -407,39 +407,33 @@ def inject_background_results(messages: list) -> int:
     if not notifications:
         return 0
 
-    blocks = [{"type": "text", "text": item} for item in notifications]
+    blocks = "\n\n".join(notifications)
     if messages and messages[-1].get("role") == "user":
         content = messages[-1].get("content", "")
-        if isinstance(content, list):
-            content.extend(blocks)
-        else:
-            messages[-1]["content"] = [
-                {"type": "text", "text": str(content)},
-                *blocks,
-            ]
+        messages[-1]["content"] = f"{content}\n\n{blocks}" if content else blocks
     else:
         messages.append({"role": "user", "content": blocks})
     return len(notifications)
 
 
-def execute_tool(block) -> str:
-    blocked = trigger_hooks("PreToolUse", block)
+def execute_tool(tool_name: str, arguments: dict, call_id: str) -> str:
+    blocked = trigger_hooks("PreToolUse", tool_name, arguments)
     if blocked is not None:
         return str(blocked)
 
-    if should_run_background(block.name, block.input):
+    if should_run_background(tool_name, arguments):
         try:
-            task_id = start_background_task(block)
+            task_id = start_background_task(tool_name, arguments, call_id)
             output = (
-                f"[Background task {task_id} started] "
-                "The result will be collected on a later turn."
+                f"[后台任务 {task_id} 已启动] "
+                "结果将在后续轮次收集。"
             )
         except Exception as error:
-            output = f"Error: {error}"
+            output = f"错误：{error}"
     else:
-        output = call_tool(block)
+        output = call_tool(tool_name, arguments)
 
-    trigger_hooks("PostToolUse", block, output)
+    trigger_hooks("PostToolUse", tool_name, arguments, output)
     return output
 
 
@@ -448,39 +442,39 @@ def execute_tool(block) -> str:
 def agent_loop(messages: list):
     while True:
         inject_background_results(messages)
-        response = client.messages.create(
+        response = client.responses.create(
             model=MODEL,
-            system=SYSTEM,
-            messages=messages,
+            instructions=SYSTEM,
+            input=messages,
             tools=TOOLS,
-            max_tokens=8000,
+            max_output_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        messages.extend(response.output)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": force})
                 continue
-            return
+            return response.output_text
 
-        results = []
-        for block in tool_calls:
-            output = execute_tool(block)
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+        for tool_call in tool_calls:
+            arguments = json.loads(tool_call.arguments)
+            output = execute_tool(tool_call.name, arguments, tool_call.call_id)
+            messages.append({
+                "type": "function_call_output",
+                "call_id": tool_call.call_id,
+                "output": output,
             })
-        messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
-    print("s11: Background Tasks - explicit background Bash execution")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("s11：后台任务 - 显式后台执行 Bash 命令")
+    print("输入问题后按回车发送，输入 q 或 exit 退出。\n")
+    print(f"请求地址：{client.base_url}responses")
 
     history = []
     while True:
@@ -492,8 +486,7 @@ if __name__ == "__main__":
             break
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        final_text = agent_loop(history)
+        if final_text:
+            print(final_text)
         print()

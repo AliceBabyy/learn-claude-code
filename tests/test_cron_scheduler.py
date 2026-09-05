@@ -17,41 +17,41 @@ LESSON = ROOT / "s12_cron_scheduler" / "code.py"
 
 
 def load_lesson(workdir: Path):
-    fake_anthropic = types.ModuleType("anthropic")
+    fake_openai = types.ModuleType("openai")
     fake_dotenv = types.ModuleType("dotenv")
 
-    class FakeAnthropic:
+    class FakeOpenAI:
         def __init__(self, *args, **kwargs):
-            self.messages = types.SimpleNamespace(create=None)
+            self.responses = types.SimpleNamespace(create=None)
 
-    fake_anthropic.Anthropic = FakeAnthropic
+    fake_openai.OpenAI = FakeOpenAI
     fake_dotenv.load_dotenv = lambda override=True: None
 
     previous_modules = {
-        "anthropic": sys.modules.get("anthropic"),
+        "openai": sys.modules.get("openai"),
         "dotenv": sys.modules.get("dotenv"),
     }
     previous_cwd = Path.cwd()
-    previous_model = os.environ.get("MODEL_ID")
+    previous_model = os.environ.get("OPENAI_MODEL_ID")
     module_name = f"cron_scheduler_test_{time.time_ns()}"
     spec = importlib.util.spec_from_file_location(module_name, LESSON)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
 
-    sys.modules["anthropic"] = fake_anthropic
+    sys.modules["openai"] = fake_openai
     sys.modules["dotenv"] = fake_dotenv
     sys.modules[module_name] = module
     try:
         os.chdir(workdir)
-        os.environ["MODEL_ID"] = "test-model"
+        os.environ["OPENAI_MODEL_ID"] = "test-model"
         spec.loader.exec_module(module)
         return module
     finally:
         os.chdir(previous_cwd)
         if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
+            os.environ.pop("OPENAI_MODEL_ID", None)
         else:
-            os.environ["MODEL_ID"] = previous_model
+            os.environ["OPENAI_MODEL_ID"] = previous_model
         for name, previous in previous_modules.items():
             if previous is None:
                 sys.modules.pop(name, None)
@@ -73,6 +73,8 @@ def test_s12_keeps_the_s04_kernel_and_adds_three_cron_tools():
             "list_crons",
             "cancel_cron",
         ]
+        assert all(tool["type"] == "function" and "parameters" in tool
+                   for tool in lesson.TOOLS)
         assert set(lesson.HOOKS) == {
             "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"
         }
@@ -142,7 +144,7 @@ def test_failed_model_call_restores_delivery_without_duplicate_message():
         lesson.scheduled_jobs[job.id] = job
         lesson.cron_queue.append(job)
         lesson.save_durable_jobs()
-        lesson.client.messages.create = (
+        lesson.client.responses.create = (
             lambda **_: (_ for _ in ()).throw(RuntimeError("offline"))
         )
 
@@ -154,25 +156,50 @@ def test_failed_model_call_restores_delivery_without_duplicate_message():
         assert job.id in lesson.scheduled_jobs
 
 
+def test_openai_history_keeps_reasoning_and_pairs_function_output():
+    with tempfile.TemporaryDirectory() as tmp:
+        lesson = load_lesson(Path(tmp))
+        reasoning = types.SimpleNamespace(type="reasoning", id="rs_1")
+        call = types.SimpleNamespace(
+            type="function_call",
+            call_id="call_list",
+            name="list_crons",
+            arguments="{}",
+        )
+        final = types.SimpleNamespace(type="message")
+        responses = [
+            types.SimpleNamespace(output=[reasoning, call], output_text=""),
+            types.SimpleNamespace(output=[final], output_text="没有Cron任务。"),
+        ]
+        lesson.client.responses.create = lambda **_: responses.pop(0)
+        messages = [{"role": "user", "content": "列出Cron任务"}]
+
+        lesson.agent_loop(messages)
+
+        assert messages[1] is reasoning
+        assert messages[2] is call
+        assert messages[3] == {
+            "type": "function_call_output",
+            "call_id": "call_list",
+            "output": "No cron jobs.",
+        }
+
+
 def test_scheduled_turn_never_reads_interactive_permission_input():
     with tempfile.TemporaryDirectory() as tmp:
         lesson = load_lesson(Path(tmp))
-        block = types.SimpleNamespace(
-            name="bash",
-            input={"command": "rm build.log"},
-        )
         results = []
 
         with patch("builtins.input", side_effect=AssertionError("input called")):
             thread = threading.Thread(
-                target=lambda: results.append(lesson.permission_hook(block))
+                target=lambda: results.append(
+                    lesson.permission_hook("bash", {"command": "rm build.log"})
+                )
             )
             thread.start()
             thread.join(timeout=1)
 
-        assert results == [
-            "Permission denied: scheduled turns cannot request interactive approval"
-        ]
+        assert results == ["权限拒绝：定时任务轮次不能请求交互式批准"]
 
 
 def test_corrupt_durable_store_reports_an_error(capsys: pytest.CaptureFixture[str]):
@@ -187,4 +214,4 @@ def test_corrupt_durable_store_reports_an_error(capsys: pytest.CaptureFixture[st
 
 
 def test_s12_code_is_ascii():
-    LESSON.read_text(encoding="ascii")
+    assert LESSON.read_text(encoding="utf-8")

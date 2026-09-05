@@ -14,7 +14,7 @@ s01 → ... → s15 → [s16](../s16_workflow_runtime/) → `s17`
 
 从 s01 开始，Agent Loop 的退出条件一直很简单：模型不再调用工具，程序就返回。
 
-这对普通对话足够，但对“修到测试全部通过”“完成所有验收项”这样的任务还不够。模型可能认为已经做完，也可能只完成了一部分。没有新的 `tool_use`，只能说明当前轮次结束了，不能直接证明整个目标已经达成。
+这对普通对话足够，但对“修到测试全部通过”“完成所有验收项”这样的任务还不够。模型可能认为已经做完，也可能只完成了一部分。没有新的`function_call`，只能说明当前轮次结束了，不能直接证明整个目标已经达成。
 
 `/goal` 在真正返回之前，再加一次独立判断。
 
@@ -31,8 +31,8 @@ s01 → ... → s15 → [s16](../s16_workflow_runtime/) → `s17`
 当主模型不再调用工具时，主循环不会立刻 `return`，而是先运行 Goal Stop hook：
 
 ```python
-if tool_results:
-    messages.append({"role": "user", "content": tool_results})
+if tool_calls:
+    messages.extend(function_call_outputs)
     continue
 
 decision = await self.goal.evaluate_after_turn(self.messages)
@@ -197,8 +197,9 @@ return SessionResult(text=text, status=decision.action)
 pip install -r requirements.txt
 
 # .env
-ANTHROPIC_API_KEY=...
-MODEL_ID=...
+OPENAI_API_KEY=...
+OPENAI_MODEL_ID=...
+OPENAI_BASE_URL=...  # 使用兼容服务时配置
 
 # 可选：给 Goal 判断器使用更小的模型
 GOAL_EVALUATOR_MODEL_ID=...

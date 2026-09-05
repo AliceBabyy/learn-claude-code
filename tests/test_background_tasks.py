@@ -13,40 +13,40 @@ LESSON = ROOT / "s11_background_tasks" / "code.py"
 
 
 def load_lesson(workdir: Path):
-    fake_anthropic = types.ModuleType("anthropic")
+    fake_openai = types.ModuleType("openai")
 
-    class FakeAnthropic:
+    class FakeOpenAI:
         def __init__(self, *args, **kwargs):
-            self.messages = types.SimpleNamespace(create=None)
+            self.responses = types.SimpleNamespace(create=None)
 
     fake_dotenv = types.ModuleType("dotenv")
-    fake_anthropic.Anthropic = FakeAnthropic
+    fake_openai.OpenAI = FakeOpenAI
     fake_dotenv.load_dotenv = lambda override=True: None
 
     previous_modules = {
-        "anthropic": sys.modules.get("anthropic"),
+        "openai": sys.modules.get("openai"),
         "dotenv": sys.modules.get("dotenv"),
     }
     previous_cwd = Path.cwd()
-    previous_model = os.environ.get("MODEL_ID")
+    previous_model = os.environ.get("OPENAI_MODEL_ID")
     module_name = f"background_tasks_test_{time.time_ns()}"
     spec = importlib.util.spec_from_file_location(module_name, LESSON)
     module = importlib.util.module_from_spec(spec)
 
-    sys.modules["anthropic"] = fake_anthropic
+    sys.modules["openai"] = fake_openai
     sys.modules["dotenv"] = fake_dotenv
     sys.modules[module_name] = module
     try:
         os.chdir(workdir)
-        os.environ["MODEL_ID"] = "test-model"
+        os.environ["OPENAI_MODEL_ID"] = "test-model"
         spec.loader.exec_module(module)
         return module
     finally:
         os.chdir(previous_cwd)
         if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
+            os.environ.pop("OPENAI_MODEL_ID", None)
         else:
-            os.environ["MODEL_ID"] = previous_model
+            os.environ["OPENAI_MODEL_ID"] = previous_model
         for name, previous in previous_modules.items():
             if previous is None:
                 sys.modules.pop(name, None)
@@ -71,7 +71,8 @@ def test_s11_keeps_the_s04_kernel_and_adds_one_bash_option():
             "bash", "read_file", "write_file", "edit_file", "glob"
         }
         bash = next(tool for tool in lesson.TOOLS if tool["name"] == "bash")
-        assert "run_in_background" in bash["input_schema"]["properties"]
+        assert bash["type"] == "function"
+        assert "run_in_background" in bash["parameters"]["properties"]
         assert set(lesson.HOOKS) == {
             "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"
         }
@@ -85,7 +86,7 @@ def test_background_execution_requires_an_explicit_bash_flag():
 
         assert not lesson.should_run_background("bash", {"command": "npm install"})
         assert lesson.should_run_background(
-            "bash", {"command": "printf ready", "run_in_background": True}
+            "bash", {"command": "echo ready", "run_in_background": True}
         )
         assert not lesson.should_run_background(
             "write_file", {"run_in_background": True}
@@ -95,39 +96,35 @@ def test_background_execution_requires_an_explicit_bash_flag():
 def test_background_bash_passes_permission_before_dispatch():
     with tempfile.TemporaryDirectory() as tmp:
         lesson = load_lesson(Path(tmp))
-        block = types.SimpleNamespace(
-            id="tool_denied",
+        call = types.SimpleNamespace(
+            id="fc_denied",
+            call_id="call_denied",
             name="bash",
-            input={"command": "rm -rf /tmp/example", "run_in_background": True},
-            type="tool_use",
+            arguments='{"command":"rm -rf /tmp/example","run_in_background":true}',
+            type="function_call",
         )
         responses = [
-            types.SimpleNamespace(stop_reason="tool_use", content=[block]),
-            types.SimpleNamespace(
-                stop_reason="end_turn",
-                content=[types.SimpleNamespace(type="text", text="Denied.")],
-            ),
+            types.SimpleNamespace(output=[call], output_text=""),
+            types.SimpleNamespace(output=[types.SimpleNamespace(type="message")], output_text="Denied."),
         ]
-        lesson.client.messages.create = lambda **_: responses.pop(0)
+        lesson.client.responses.create = lambda **_: responses.pop(0)
         history = [{"role": "user", "content": "Delete the directory"}]
 
         lesson.agent_loop(history)
 
         assert not lesson.background_tasks
-        result = history[2]["content"][0]
-        assert result["type"] == "tool_result"
-        assert "Permission denied" in result["content"]
+        result = history[2]
+        assert result["type"] == "function_call_output"
+        assert result["call_id"] == "call_denied"
+        assert "权限拒绝" in result["output"]
 
 
 def test_completed_result_is_collected_once_before_a_later_llm_call():
     with tempfile.TemporaryDirectory() as tmp:
         lesson = load_lesson(Path(tmp))
-        block = types.SimpleNamespace(
-            id="tool_ready",
-            name="bash",
-            input={"command": "printf ready", "run_in_background": True},
+        task_id = lesson.start_background_task(
+            "bash", {"command": "echo ready", "run_in_background": True}, "call_ready"
         )
-        task_id = lesson.start_background_task(block)
         assert wait_until(
             lambda: lesson.background_tasks[task_id]["status"] == "completed"
         )
@@ -135,13 +132,13 @@ def test_completed_result_is_collected_once_before_a_later_llm_call():
         seen_messages = []
 
         def respond(**kwargs):
-            seen_messages.append(copy.deepcopy(kwargs["messages"]))
+            seen_messages.append(copy.deepcopy(kwargs["input"]))
             return types.SimpleNamespace(
-                stop_reason="end_turn",
-                content=[types.SimpleNamespace(type="text", text="Received.")],
+                output=[types.SimpleNamespace(type="message")],
+                output_text="Received.",
             )
 
-        lesson.client.messages.create = respond
+        lesson.client.responses.create = respond
         history = [{"role": "user", "content": "Continue"}]
         lesson.agent_loop(history)
 
@@ -154,4 +151,4 @@ def test_completed_result_is_collected_once_before_a_later_llm_call():
 
 
 def test_s11_code_is_ascii():
-    LESSON.read_text(encoding="ascii")
+    assert LESSON.read_text(encoding="utf-8")

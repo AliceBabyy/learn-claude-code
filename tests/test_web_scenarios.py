@@ -204,12 +204,12 @@ def test_s16_scenario_matches_the_deterministic_runtime(tmp_path: Path) -> None:
     workflow.create_run_id = lambda _meta: "wf_review-changes_0000000000001a7b"
     actual = asyncio.run(workflow.run_workflow(**call_input))
 
-    assert set(call_input) <= set(workflow.WORKFLOW_TOOL["input_schema"]["properties"])
+    assert set(call_input) <= set(workflow.WORKFLOW_TOOL["parameters"]["properties"])
     assert shown_result == actual
 
 
 def test_generated_s16_metadata_extends_s15_without_registry_false_positives() -> None:
-    versions = json.loads(GENERATED_VERSIONS.read_text())
+    versions = json.loads(GENERATED_VERSIONS.read_text(encoding="utf-8"))
     by_id = {version["id"]: version for version in versions["versions"]}
     s15 = by_id["s15"]
     s16 = by_id["s16"]
@@ -225,7 +225,7 @@ def test_generated_s16_metadata_extends_s15_without_registry_false_positives() -
     for lesson_id in ("s11", "s12", "s13", "s14", "s15", "s16"):
         assert by_id[lesson_id]["source"] == (
             chapter_dirs[lesson_id] / "code.py"
-        ).read_text()
+            ).read_text(encoding="utf-8")
     signatures = {
         function["name"]: function["signature"]
         for function in s16["functions"]

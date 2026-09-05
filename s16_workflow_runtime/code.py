@@ -19,7 +19,11 @@ Run:
 """
 
 import asyncio
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+    import msvcrt
 import hashlib
 import importlib.util
 import json
@@ -85,6 +89,26 @@ _run_locks_guard = threading.Lock()
 _run_locks: dict[str, threading.Lock] = {}
 
 
+def _lock_file(handle):
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write("\0")
+        handle.flush()
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+
+def _unlock_file(handle):
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    handle.seek(0)
+    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 @contextmanager
 def workflow_run_lock(run_id: str):
     """Hold one run across threads and host processes for its full lifecycle."""
@@ -94,12 +118,14 @@ def workflow_run_lock(run_id: str):
         raise WorkflowInputError(f"workflow run {run_id} is already active")
 
     handle = None
+    file_locked = False
     try:
         STORE.mkdir(parents=True, exist_ok=True)
         handle = (STORE / f"{run_id}.lock").open("a+")
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
+            _lock_file(handle)
+            file_locked = True
+        except (BlockingIOError, OSError) as exc:
             raise WorkflowInputError(
                 f"workflow run {run_id} is already active"
             ) from exc
@@ -107,7 +133,8 @@ def workflow_run_lock(run_id: str):
     finally:
         if handle is not None:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if file_locked:
+                    _unlock_file(handle)
             finally:
                 handle.close()
         local_lock.release()
@@ -244,11 +271,7 @@ class MockAgentRunner:
 
 
 def _response_text(response) -> str:
-    return "\n".join(
-        str(getattr(block, "text", ""))
-        for block in getattr(response, "content", [])
-        if getattr(block, "type", None) == "text"
-    ).strip()
+    return str(getattr(response, "output_text", "") or "").strip()
 
 
 def _parse_runner_json(text: str) -> object:
@@ -274,7 +297,7 @@ def _parse_runner_json(text: str) -> object:
         raise WorkflowInputError("workflow agent returned invalid JSON")
 
 
-class AnthropicAgentRunner:
+class OpenAIAgentRunner:
     """Run workflow agents through the same API client as the host."""
 
     def __init__(self, client, model):
@@ -288,15 +311,15 @@ class AnthropicAgentRunner:
                 "\n\nReturn only one JSON object matching this schema:\n"
                 + json.dumps(schema, ensure_ascii=True, sort_keys=True)
             )
-        response = self.client.messages.create(
+        response = self.client.responses.create(
             model=self.model,
-            system=(
+            instructions=(
                 "You are a focused workflow agent. Complete only the supplied "
                 "step. Do not claim access to files or results not included in "
                 "the prompt."
             ),
-            messages=[{"role": "user", "content": request}],
-            max_tokens=2000,
+            input=[{"role": "user", "content": request}],
+            max_output_tokens=2000,
         )
         text = _response_text(response)
         if schema is None:
@@ -714,9 +737,10 @@ async def sample_workflow(ctx, args):
 WORKFLOWS = {SAMPLE_META["name"]: (SAMPLE_META, sample_workflow)}
 
 WORKFLOW_TOOL = {
+    "type": "function",
     "name": "Workflow",
     "description": "Run a saved workflow by name. Pass input in args.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "name": {"type": "string"},
@@ -778,7 +802,7 @@ def run_workflow_sync(**tool_input):
 def install_workflow_tool(host):
     """Extend the s15 host tool pool without changing its dispatch loop."""
     global RUNNER_FACTORY
-    RUNNER_FACTORY = lambda: AnthropicAgentRunner(host.client, host.MODEL)
+    RUNNER_FACTORY = lambda: OpenAIAgentRunner(host.client, host.MODEL)
     if getattr(host, "_workflow_tool_installed", False):
         return
     base_assemble = host.assemble_tool_pool

@@ -24,7 +24,7 @@ S11 要解决的问题是：让耗时的 Bash 命令在后台执行，使 Agent 
 
 ![Background Tasks Overview](images/background-tasks-overview.svg)
 
-本章把慢操作放入后台线程。当前工具调用先返回一个占位 `tool_result`，Agent Loop 可以继续运行；后续轮次开始时再收集已经完成的结果，以通知形式加入对话。
+本章把慢操作放入后台线程。当前函数调用先返回一个占位 `function_call_output`，Agent Loop 可以继续运行；后续轮次开始时再收集已经完成的结果，以通知形式加入对话。
 
 同步 vs 后台：
 
@@ -65,7 +65,7 @@ class BackgroundManager:
         self._ready = []
         self._lock = threading.Lock()
 
-    def start(self, block) -> str:
+    def start(self, tool_name, arguments, call_id) -> str:
         # Register task, then run _run() in a daemon thread.
         ...
 
@@ -89,7 +89,7 @@ def collect_background_results() -> list[str]:
     return BACKGROUND.collect()
 ```
 
-通知不复用原始 `tool_use_id`。原始 tool call 已经用占位 `tool_result` 回复了；后续收集完成结果时，会用 `task_notification` 格式把它作为独立事件加入对话。一个 `tool_use` 仍然只对应一个 `tool_result`。
+通知不复用原始 `call_id`。原始函数调用已经用占位 `function_call_output` 回复了；后续收集完成结果时，会用 `task_notification` 格式把它作为独立事件加入对话。一个 `function_call` 仍然只对应一个 `function_call_output`。
 
 ### 循环中的集成
 
@@ -98,22 +98,22 @@ def collect_background_results() -> list[str]:
 ```python
 while True:
     inject_background_results(messages)
-    response = client.messages.create(...)
+    response = client.responses.create(...)
 
-def execute_tool(block) -> str:
-    blocked = trigger_hooks("PreToolUse", block)
+def execute_tool(tool_name, arguments, call_id) -> str:
+    blocked = trigger_hooks("PreToolUse", tool_name, arguments)
     if blocked is not None:
         return str(blocked)
-    if should_run_background(block.name, block.input):
-        task_id = start_background_task(block)
-        output = f"[Background task {task_id} started]"
+    if should_run_background(tool_name, arguments):
+        task_id = start_background_task(tool_name, arguments, call_id)
+        output = f"[后台任务 {task_id} 已启动]"
     else:
-        output = call_tool(block)
-    trigger_hooks("PostToolUse", block, output)
+    output = call_tool(tool_name, arguments)
+    trigger_hooks("PostToolUse", tool_name, arguments, output)
     return output
 ```
 
-慢操作先返回一个带 `bg_id` 的占位 tool_result。后台结果不会主动唤醒 Agent；下一次进入 Agent Loop 时，`inject_background_results()` 才会收集已经完成的结果。
+慢操作先返回一个带 `bg_id` 的占位 `function_call_output`。后台结果不会主动唤醒 Agent；下一次进入 Agent Loop 时，`inject_background_results()` 才会收集已经完成的结果。
 
 ### 合起来跑
 
@@ -121,12 +121,12 @@ def execute_tool(block) -> str:
 Turn 1:
   LLM → bash "npm install" (run_in_background=true)
   → start_background_task → bg_0001
-  → tool_result: "[Background task bg_0001 started]..."
+  → function_call_output: "[后台任务 bg_0001 已启动]..."
   → LLM: "OK, I'll check later. Let me also read the config."
 
 Turn 2:
   LLM → read_file "package.json" (fast, sync)
-  → tool_result: file content
+  → function_call_output: 文件内容
 
 Turn 3:
   → collect bg_0001 as <task_notification>
@@ -145,7 +145,7 @@ npm install 在后台运行时，Agent Loop 继续执行了 read_file。
 | bash schema | `command` | `command` + `run_in_background` |
 | 新函数 | — | `should_run_background`, `start_background_task`, `collect_background_results`, `inject_background_results` |
 | 新类型 | — | `BackgroundManager` |
-| 通知格式 | — | `<task_notification>`（不复用 tool_use_id） |
+| 通知格式 | — | `<task_notification>`（不复用 `call_id`） |
 | 循环行为 | 工具同步执行 | 显式后台执行，后续轮次收集完成结果 |
 | 工具 | 5 | 5（bash schema 增加一个参数） |
 

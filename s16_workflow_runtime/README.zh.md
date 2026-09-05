@@ -24,7 +24,7 @@ s01 → ... → s14 → [s15](../s15_integrated_harness/) → `s16` → [s17](..
 
 在 harness 的工具池里加入一个 `Workflow` 工具。宿主注册由 `agent() / parallel() / pipeline() / phase()` 组成的可信脚本。模型只提供保存好的 workflow 名称、参数和可选的续跑 run ID，不会提交可执行代码或元数据。
 
-workflow 以一次 `tool_use` 进入主循环。脚本运行时，runtime 会发出生命周期和进度事件，并把每一步写进磁盘上的 journal。脚本结束后，这次调用返回启动信息、结果和任务状态。脚本里的中间结果存在变量里，不会塞进对话历史。下次用 `resume_from_run_id` 重启时，没改过的 `agent()` 会直接使用 journal 中的结果。
+workflow 以一次`function_call`进入主循环。脚本运行时，runtime 会发出生命周期和进度事件，并把每一步写进磁盘上的 journal。脚本结束后，这次调用通过同一`call_id`的`function_call_output`返回启动信息、结果和任务状态。脚本里的中间结果存在变量里，不会塞进对话历史。下次用 `resume_from_run_id` 重启时，没改过的 `agent()` 会直接使用 journal 中的结果。
 
 ![Workflow Runtime 总览](images/workflow-runtime-overview.svg)
 
@@ -48,7 +48,8 @@ async def sample_workflow(ctx, args):
 ```python
 WORKFLOW_TOOL = {
     "name": "Workflow",
-    "input_schema": {
+    "type": "function",
+    "parameters": {
         "type": "object",
         "properties": {
             "name": {"type": "string"},

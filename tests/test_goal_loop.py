@@ -21,26 +21,28 @@ SPEC.loader.exec_module(goal_loop)
 
 def text_response(text: str):
     return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)],
+        output=[SimpleNamespace(
+            type="message", role="assistant",
+            content=[SimpleNamespace(type="output_text", text=text)],
+        )],
+        output_text=text,
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
 
-def tool_response(name: str, arguments: dict, tool_use_id: str = "tool-1"):
+def tool_response(name: str, arguments: dict, call_id: str = "tool-1"):
     return SimpleNamespace(
-        content=[
-            SimpleNamespace(
-                type="tool_use",
-                id=tool_use_id,
-                name=name,
-                input=arguments,
-            )
-        ],
+        output=[SimpleNamespace(
+            type="function_call", id=f"fc-{call_id}",
+            call_id=call_id, name=name,
+            arguments=__import__("json").dumps(arguments),
+        )],
+        output_text="",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
 
-class FakeMessages:
+class FakeResponses:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
@@ -54,7 +56,11 @@ class FakeMessages:
 
 class FakeClient:
     def __init__(self, responses):
-        self.messages = FakeMessages(responses)
+        self.responses = FakeResponses(responses)
+
+
+def value(item, key, default=None):
+    return item.get(key, default) if isinstance(item, dict) else getattr(item, key, default)
 
 
 class RecordingEvaluator:
@@ -121,25 +127,25 @@ def test_unmet_goal_continues_automatically_until_achieved(
 
         assert result.status == "achieved"
         assert session.goal.active is None
-        assert len(client.messages.calls) == 2
+        assert len(client.responses.calls) == 2
         assert len(evaluator.calls) == 2
         assert any(
-            "No test result appears" in str(message["content"])
-            for message in session.messages
-            if message["role"] == "user"
+                "No test result appears" in str(value(message, "content", ""))
+                for message in session.messages
+                if value(message, "role") == "user"
         )
 
     asyncio.run(scenario())
 
 
-def test_worker_tool_result_reaches_the_goal_evaluator(
+def test_worker_function_output_reaches_the_goal_evaluator(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
         session, client, evaluator = make_session(
             tmp_path,
             responses=[
-                tool_response("bash", {"command": "printf passed"}),
+                tool_response("bash", {"command": "echo passed"}),
                 text_response("The command exited successfully."),
             ],
             evaluations=[
@@ -155,11 +161,14 @@ def test_worker_tool_result_reaches_the_goal_evaluator(
         )
 
         assert result.status == "achieved"
-        assert len(client.messages.calls) == 2
-        assert client.messages.calls[0]["tools"] == goal_loop.TOOLS
+        assert len(client.responses.calls) == 2
+        assert client.responses.calls[0]["tools"] == goal_loop.TOOLS
         _condition, messages = evaluator.calls[0]
         assert any(
-            "exit_code=0" in goal_loop._plain_content(message["content"])
+                "exit_code=0" in goal_loop._plain_content(
+                    [message] if value(message, "type") == "function_call_output"
+                    else value(message, "content", "")
+                )
             for message in messages
         )
 
@@ -185,8 +194,8 @@ def test_evaluator_receives_the_conversation_without_origin_filtering(
 
         _condition, messages = evaluator.calls[0]
         assert any(
-            message["role"] == "assistant"
-            and goal_loop._plain_content(message["content"]) == "tests passed"
+                value(message, "role") == "assistant"
+                and goal_loop._plain_content(value(message, "content", "")) == "tests passed"
             for message in messages
         )
 
@@ -243,10 +252,10 @@ def test_background_result_reenters_the_same_goal_loop(
         )
 
         assert completed.status == "achieved"
-        assert len(client.messages.calls) == 2
+        assert len(client.responses.calls) == 2
         assert len(evaluator.calls) == 1
         assert any(
-            "Background task completed" in str(message["content"])
+                "Background task completed" in str(value(message, "content", ""))
             for message in session.messages
         )
 
@@ -276,7 +285,7 @@ def test_block_cap_returns_control_but_keeps_goal_active(
 
         assert result.status == "limit"
         assert session.goal.active is not None
-        assert len(client.messages.calls) == 3
+        assert len(client.responses.calls) == 3
 
     asyncio.run(scenario())
 
@@ -404,7 +413,7 @@ def test_prompt_evaluator_uses_a_tool_free_json_response() -> None:
 
         assert result.ok is False
         assert result.reason == "test output is missing"
-        call = client.messages.calls[0]
+        call = client.responses.calls[0]
         assert "tools" not in call
         assert call["model"] == "evaluator-model"
 
@@ -497,7 +506,7 @@ def test_goal_loop_keeps_the_s04_base_tools_and_permission_hook(
         name="write_file",
         input={"path": "../outside.txt", "content": "blocked"},
     )
-    assert "outside" in session.trigger_hooks("PreToolUse", block)
+    assert "outside" in session.trigger_hooks("PreToolUse", block.name, block.input)
     assert not (tmp_path.parent / "outside.txt").exists()
 
 

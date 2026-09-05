@@ -13,43 +13,43 @@ LESSON = ROOT / "s10_task_system" / "code.py"
 
 
 def load_lesson(workdir: Path):
-    fake_anthropic = types.ModuleType("anthropic")
+    fake_openai = types.ModuleType("openai")
     fake_dotenv = types.ModuleType("dotenv")
 
-    class FakeAnthropic:
+    class FakeOpenAI:
         def __init__(self, *args, **kwargs):
-            self.messages = types.SimpleNamespace(create=None)
+            self.responses = types.SimpleNamespace(create=None)
 
-    fake_anthropic.Anthropic = FakeAnthropic
+    fake_openai.OpenAI = FakeOpenAI
     fake_dotenv.load_dotenv = lambda override=True: None
 
     previous_modules = {
-        "anthropic": sys.modules.get("anthropic"),
+        "openai": sys.modules.get("openai"),
         "dotenv": sys.modules.get("dotenv"),
     }
     previous_cwd = Path.cwd()
-    previous_model = os.environ.get("MODEL_ID")
+    previous_model = os.environ.get("OPENAI_MODEL_ID")
 
     module_name = f"s10_task_system_test_{id(workdir)}"
     spec = importlib.util.spec_from_file_location(module_name, LESSON)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
 
-    sys.modules["anthropic"] = fake_anthropic
+    sys.modules["openai"] = fake_openai
     sys.modules["dotenv"] = fake_dotenv
     sys.modules[module_name] = module
     try:
         os.chdir(workdir)
-        os.environ["MODEL_ID"] = "test-model"
+        os.environ["OPENAI_MODEL_ID"] = "test-model"
         spec.loader.exec_module(module)
         return module
     finally:
         os.chdir(previous_cwd)
         sys.modules.pop(module_name, None)
         if previous_model is None:
-            os.environ.pop("MODEL_ID", None)
+            os.environ.pop("OPENAI_MODEL_ID", None)
         else:
-            os.environ["MODEL_ID"] = previous_model
+            os.environ["OPENAI_MODEL_ID"] = previous_model
         for name, previous in previous_modules.items():
             if previous is None:
                 sys.modules.pop(name, None)
@@ -58,7 +58,7 @@ def load_lesson(workdir: Path):
 
 
 def tool_call(name: str, **arguments):
-    return types.SimpleNamespace(name=name, input=arguments, id="tool-1")
+    return name, arguments
 
 
 def test_s10_keeps_the_s04_kernel_and_adds_task_tools() -> None:
@@ -85,8 +85,8 @@ def test_s10_keeps_the_s04_kernel_and_adds_task_tools() -> None:
         assert not (workdir / ".tasks").exists()
 
         tools = {tool["name"]: tool for tool in lesson.TOOLS}
-        create_schema = tools["create_task"]["input_schema"]
-        update_schema = tools["update_task"]["input_schema"]
+        create_schema = tools["create_task"]["parameters"]
+        update_schema = tools["update_task"]["parameters"]
         assert "blockedBy" not in create_schema["properties"]
         assert create_schema["additionalProperties"] is False
         assert update_schema["required"] == ["task_id", "addBlockedBy"]
@@ -117,7 +117,7 @@ def test_dependencies_are_added_after_create_returns_runtime_ids() -> None:
         lesson = load_lesson(Path(tmp))
 
         create_results = [
-            lesson.execute_tool(tool_call("create_task", subject=subject))
+            lesson.execute_tool(*tool_call("create_task", subject=subject))
             for subject in (
                 "create schema",
                 "write API",
@@ -129,13 +129,13 @@ def test_dependencies_are_added_after_create_returns_runtime_ids() -> None:
         schema_id, api_id, tests_id, docs_id = task_ids
 
         update_results = [
-            lesson.execute_tool(tool_call(
+            lesson.execute_tool(*tool_call(
                 "update_task", task_id=api_id, addBlockedBy=[schema_id]
             )),
-            lesson.execute_tool(tool_call(
+            lesson.execute_tool(*tool_call(
                 "update_task", task_id=tests_id, addBlockedBy=[api_id]
             )),
-            lesson.execute_tool(tool_call(
+            lesson.execute_tool(*tool_call(
                 "update_task", task_id=docs_id, addBlockedBy=[schema_id]
             )),
         ]
@@ -151,9 +151,9 @@ def test_invalid_and_missing_task_ids_become_tool_results() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         lesson = load_lesson(Path(tmp))
 
-        invalid = lesson.execute_tool(tool_call("get_task", task_id="../outside"))
+        invalid = lesson.execute_tool(*tool_call("get_task", task_id="../outside"))
         missing = lesson.execute_tool(
-            tool_call("claim_task", task_id="task_00000000")
+            *tool_call("claim_task", task_id="task_00000000")
         )
 
         assert invalid.startswith("Error: Invalid task ID")
@@ -182,12 +182,12 @@ def test_update_rejects_invalid_graph_changes_without_partial_mutation() -> None
         dependency = lesson.create_task("create schema")
         target = lesson.create_task("write API")
 
-        missing = lesson.execute_tool(tool_call(
+        missing = lesson.execute_tool(*tool_call(
             "update_task",
             task_id=target.id,
             addBlockedBy=[dependency.id, "task_00000000"],
         ))
-        self_dependency = lesson.execute_tool(tool_call(
+        self_dependency = lesson.execute_tool(*tool_call(
             "update_task", task_id=target.id, addBlockedBy=[target.id]
         ))
 
@@ -207,7 +207,7 @@ def test_update_is_idempotent_and_rejects_cycles_or_started_tasks() -> None:
         lesson.update_task(second.id, [first.id])
         lesson.update_task(third.id, [second.id])
 
-        cycle = lesson.execute_tool(tool_call(
+        cycle = lesson.execute_tool(*tool_call(
             "update_task", task_id=first.id, addBlockedBy=[third.id]
         ))
         assert cycle.startswith("Error: Dependency cycle detected")
@@ -215,7 +215,7 @@ def test_update_is_idempotent_and_rejects_cycles_or_started_tasks() -> None:
         assert lesson.load_task(second.id).blockedBy == [first.id]
 
         assert "Claimed" in lesson.claim_task(first.id)
-        started = lesson.execute_tool(tool_call(
+        started = lesson.execute_tool(*tool_call(
             "update_task", task_id=first.id, addBlockedBy=[second.id]
         ))
         assert "only be updated while pending and unowned" in started
@@ -225,13 +225,16 @@ def test_task_store_rejects_a_symlink_outside_the_workspace() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         with tempfile.TemporaryDirectory() as outside:
             workdir = Path(tmp)
-            (workdir / ".tasks").symlink_to(
-                Path(outside), target_is_directory=True
-            )
+            try:
+                (workdir / ".tasks").symlink_to(
+                    Path(outside), target_is_directory=True
+                )
+            except OSError:
+                pytest.skip("当前Windows用户没有创建符号链接的权限")
             lesson = load_lesson(workdir)
 
             output = lesson.execute_tool(
-                tool_call("create_task", subject="unsafe")
+                *tool_call("create_task", subject="unsafe")
             )
 
             assert output == "Error: Task store escapes the workspace"

@@ -43,16 +43,16 @@ S15 不再引入新机制，而是把前面各章的组件集成到同一个 har
   → context compact
   → memory + skills + MCP 状态组装 system prompt
   → LLM
-  → has tool_use block?
+  → 包含 function_call？
       否 → Stop hooks → 返回
       是 → PreToolUse hooks + permission
           → TOOL_HANDLERS / MCP handlers / background dispatch
           → PostToolUse hooks
-          → tool_result / task_notification 回 messages
+          → function_call_output / task_notification 回到messages
           → 下一轮
 ```
 
-循环仍是同一个结构：调用模型，检查响应里是否出现 `tool_use` block，执行工具，再把结果追加回 `messages`。是否继续工具轮，由响应中有没有实际的 `tool_use` block 决定。
+循环仍是同一个结构：调用模型，保存全部`response.output`，检查是否出现`function_call`，执行工具，再把带相同`call_id`的`function_call_output`追加回`messages`。是否继续工具轮，由响应中有没有实际的`function_call`决定。
 
 ---
 
@@ -63,15 +63,15 @@ S15 不再引入新机制，而是把前面各章的组件集成到同一个 har
 | 用户输入前后 | `UserPromptSubmit` hooks | 记录、注入、审计用户输入 |
 | LLM 前 | cron queue | 把定时触发的 prompt 注入 `messages` |
 | LLM 前 | background notifications | 后台任务完成后以 `<task_notification>` 注入 |
-| LLM 前 | compaction pipeline | 先压大输出，再裁历史，再压旧 tool_result，必要时摘要 |
+| LLM 前 | compaction pipeline | 先压大输出，再裁历史，再压旧function_call_output，必要时摘要 |
 | LLM 前 | memory / skills / MCP state | 组装 system prompt，让模型看到当前能力和长期上下文 |
 | LLM 调用 | error recovery | 429/529 重试，`max_tokens` 升级，prompt too long 触发 reactive compact |
 | 工具执行前 | `PreToolUse` hooks + permission | 拦截危险命令、写越界、破坏性 MCP 工具 |
 | 工具分发 | `assemble_tool_pool` | 组装内置工具和 MCP 动态工具 |
 | 工具执行时 | background dispatch | 显式标记的 bash 操作放入 daemon thread，主循环先返回占位结果 |
 | 工具执行后 | `PostToolUse` hooks | 大输出告警、日志等后处理 |
-| 返回循环 | tool_result | 每个 `tool_use` 对应一个 `tool_result`，再回到下一轮 |
-| 本轮没有 tool_use / 停止时 | `Stop` hooks | 统计、清理、审计 |
+| 返回循环 | function_call_output | 每个`function_call`对应一个同`call_id`的结果，再回到下一轮 |
+| 本轮没有function_call / 停止时 | `Stop` hooks | 统计、清理、审计 |
 
 ---
 
@@ -108,7 +108,7 @@ BUILTIN_HANDLERS + mcp__server__tool handlers
 ```python
 blocked = trigger_hooks("PreToolUse", block)
 if blocked:
-    results.append(tool_result(block.id, blocked))
+    messages.append(function_call_output(tool_call.call_id, blocked))
     continue
 ```
 
@@ -151,7 +151,7 @@ S15 直接复用 s09 的 Memory runtime。每轮调用模型前，它读取 `.me
 LLM 前先跑压缩管线：
 
 ```text
-tool_result_budget → snip_compact → micro_compact → compact_history
+function_output_budget → snip_compact → micro_compact → compact_history
 ```
 
 调用模型时再包一层恢复：
@@ -166,7 +166,7 @@ tool_result_budget → snip_compact → micro_compact → compact_history
 bash 调用设置 `run_in_background=true` 后，主循环不再等待命令结束，而是先返回占位结果：
 
 ```text
-should_run_background → start_background_task → placeholder tool_result
+should_run_background → start_background_task → 占位function_call_output
 后台完成 → task_notification → 下一轮注入 messages
 ```
 

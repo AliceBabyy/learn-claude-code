@@ -3,7 +3,7 @@
 s13: Agent Teams - persistent teammates with shared tasks and mailboxes.
 
 Run:  python s13_agent_teams/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+需要：pip install openai python-dotenv，并在 .env 中配置 OPENAI_API_KEY
 
     +------+  spawn(task_id)  +----------+  result  +------+
     | Lead | ---------------> |   WORK   | -------> | IDLE |
@@ -20,7 +20,10 @@ Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
     .worktrees/   optional task-bound working directories
 """
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import random
@@ -41,16 +44,15 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url=os.getenv("OPENAI_BASE_URL") or None)
+MODEL = os.getenv("OPENAI_MODEL_ID")
+if not MODEL:
+    raise RuntimeError("缺少 OPENAI_MODEL_ID，请在项目根目录的 .env 中配置模型名称")
 
 # -- Task System --
 
@@ -75,7 +77,8 @@ def task_store_lock():
         if depth == 0:
             TASKS_DIR.mkdir(parents=True, exist_ok=True)
             handle = TASK_LOCK_PATH.open("a+")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             _task_store_state.handle = handle
         _task_store_state.depth = depth + 1
         try:
@@ -84,7 +87,8 @@ def task_store_lock():
             _task_store_state.depth -= 1
             if _task_store_state.depth == 0:
                 handle = _task_store_state.handle
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 handle.close()
                 del _task_store_state.handle
 
@@ -1026,25 +1030,25 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     return f"Plan submitted ({request_id}). Wait for Lead's decision."
 
 
-def _run_teammate_tool(name: str, block, handlers: dict) -> str:
+def _run_teammate_tool(name: str, tool_name: str, arguments: dict, handlers: dict) -> str:
     gate = plan_gates.get(name, "not_required")
-    if block.name in {"bash", "write_file", "edit_file"}:
+    if tool_name in {"bash", "write_file", "edit_file"}:
         if gate != "approved":
             if gate != "not_required":
                 return (f"Blocked: plan status is {gate}. Submit or revise the "
                         "plan and wait for approval before changing the workspace.")
-        blocked = check_permission(block, prompt_user=False)
+        blocked = check_permission(tool_name, arguments, prompt_user=False)
         if blocked:
             return blocked
-    handler = handlers.get(block.name)
+    handler = handlers.get(tool_name)
     if not handler:
-        return f"Unknown tool: {block.name}"
-    trigger_hooks("PreToolUse", block, skip_permission=True)
+        return f"错误：未知工具 {tool_name}"
+    trigger_hooks("PreToolUse", tool_name, arguments, skip_permission=True)
     try:
-        output = str(handler(**block.input))
+        output = str(handler(**arguments))
     except Exception as exc:
-        output = f"Error: {type(exc).__name__}: {exc}"
-    trigger_hooks("PostToolUse", block, output)
+        output = f"错误：{type(exc).__name__}: {exc}"
+    trigger_hooks("PostToolUse", tool_name, arguments, output)
     return output
 
 
@@ -1266,36 +1270,36 @@ class TeammateRuntime:
         with team_lock:
             active_teammates[self.name] = "working"
         try:
-            response = client.messages.create(
+            response = client.responses.create(
                 model=MODEL,
-                system=self.system,
-                messages=self.messages,
+                instructions=self.system,
+                input=self.messages,
                 tools=TEAMMATE_TOOLS,
-                max_tokens=8000,
+                max_output_tokens=8000,
             )
         except Exception as exc:
             BUS.send(self.name, "lead",
                      f"{type(exc).__name__}: {exc}", "error")
             return "stop"
 
-        self.messages.append({"role": "assistant",
-                              "content": response.content})
+        self.messages.extend(response.output)
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if tool_calls:
-            results = []
-            for block in tool_calls:
+            for tool_call in tool_calls:
+                arguments = json.loads(tool_call.arguments)
                 output = _run_teammate_tool(
-                    self.name, block, self.handlers
+                    self.name, tool_call.name, arguments, self.handlers
                 )
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": output})
-            self.messages.append({"role": "user", "content": results})
+                self.messages.append({
+                    "type": "function_call_output",
+                    "call_id": tool_call.call_id,
+                    "output": output,
+                })
             return "continue"
 
-        summary = _last_assistant_text(response.content)
+        summary = response.output_text
         gate = plan_gates.get(self.name, "not_required")
         if gate != "pending" and summary:
             BUS.send(self.name, "lead", summary, "result")
@@ -1499,44 +1503,44 @@ def run_create_worktree(name: str, task_id: str) -> str:
 # -- Tool Definitions --
 
 BASE_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object",
                       "properties": {"command": {"type": "string"}},
                       "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "limit": {"type": "integer"}},
                       "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text once.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "edit_file", "description": "Replace exact text once.",
+     "parameters": {"type": "object",
                       "properties": {"path": {"type": "string"},
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
                       "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files by glob pattern.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "glob", "description": "Find files by glob pattern.",
+     "parameters": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
                       "required": ["pattern"]}},
 ]
 
 TASK_TOOLS = [
-    {"name": "create_task",
+    {"type": "function", "name": "create_task",
      "description": "Create a task and return its runtime-generated ID.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {
                           "subject": {"type": "string"},
                           "description": {"type": "string"}},
                       "required": ["subject"],
                       "additionalProperties": False}},
-    {"name": "update_task",
+    {"type": "function", "name": "update_task",
      "description": "Add dependencies using IDs returned by create_task.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {
                           "task_id": {"type": "string",
                                       "pattern": "^task_[0-9a-f]{8}$"},
@@ -1547,33 +1551,33 @@ TASK_TOOLS = [
                               "minItems": 1}},
                       "required": ["task_id", "addBlockedBy"],
                       "additionalProperties": False}},
-    {"name": "list_tasks", "description": "List shared tasks.",
-     "input_schema": {"type": "object", "properties": {}}},
-    {"name": "get_task", "description": "Get one task by ID.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "list_tasks", "description": "List shared tasks.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"type": "function", "name": "get_task", "description": "Get one task by ID.",
+     "parameters": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "claim_task", "description": "Claim a ready task.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "claim_task", "description": "Claim a ready task.",
+     "parameters": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "complete_task", "description": "Complete an owned task.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "complete_task", "description": "Complete an owned task.",
+     "parameters": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
 ]
 
 TEAMMATE_TOOLS = [
     *BASE_TOOLS,
-    {"name": "send_message",
+    {"type": "function", "name": "send_message",
      "description": "Send an intermediate message to 'lead' or an active teammate.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
-    {"name": "submit_plan",
+    {"type": "function", "name": "submit_plan",
      "description": "Submit a work plan for Lead approval.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"plan": {"type": "string"}},
                       "required": ["plan"]}},
     next(tool for tool in TASK_TOOLS if tool["name"] == "list_tasks"),
@@ -1582,9 +1586,9 @@ TEAMMATE_TOOLS = [
 ]
 
 TEAM_TOOLS = [
-    {"name": "spawn_teammate",
+    {"type": "function", "name": "spawn_teammate",
      "description": "Spawn a persistent teammate.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {
                           "name": {"type": "string",
                                    "pattern": "^[A-Za-z0-9_-]{1,64}$"},
@@ -1594,34 +1598,34 @@ TEAM_TOOLS = [
                                       "pattern": "^task_[0-9a-f]{8}$"},
                           "require_plan": {"type": "boolean"}},
                       "required": ["name", "role", "prompt"]}},
-    {"name": "list_teammates", "description": "List active teammates.",
-     "input_schema": {"type": "object", "properties": {}}},
-    {"name": "send_message", "description": "Message a teammate.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "list_teammates", "description": "List active teammates.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"type": "function", "name": "send_message", "description": "Message a teammate.",
+     "parameters": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
-    {"name": "request_shutdown",
+    {"type": "function", "name": "request_shutdown",
      "description": "Ask a teammate to shut down.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"teammate": {"type": "string"}},
                       "required": ["teammate"]}},
-    {"name": "request_plan",
+    {"type": "function", "name": "request_plan",
      "description": "Require a teammate plan before workspace changes.",
-     "input_schema": {"type": "object",
+     "parameters": {"type": "object",
                       "properties": {"teammate": {"type": "string"},
                                      "task": {"type": "string"}},
                       "required": ["teammate", "task"]}},
-    {"name": "review_plan", "description": "Approve or reject a plan.",
-     "input_schema": {"type": "object",
+    {"type": "function", "name": "review_plan", "description": "Approve or reject a plan.",
+     "parameters": {"type": "object",
                       "properties": {
                           "request_id": {"type": "string"},
                           "approve": {"type": "boolean"},
                           "feedback": {"type": "string"}},
                       "required": ["request_id", "approve"]}},
-    {"name": "create_worktree",
+    {"type": "function", "name": "create_worktree",
      "description": "Create and bind a task worktree.",
-     "input_schema": {
+     "parameters": {
          "type": "object",
          "properties": {
              "name": {"type": "string",
@@ -1677,43 +1681,43 @@ def trigger_hooks(event: str, *args, skip_permission: bool = False):
     return None
 
 
-def check_permission(block, prompt_user: bool = True) -> str | None:
-    if block.name == "bash":
-        command = block.input.get("command", "")
+def check_permission(tool_name: str, arguments: dict, prompt_user: bool = True) -> str | None:
+    if tool_name == "bash":
+        command = arguments.get("command", "")
         for pattern in DENY_LIST:
             if pattern in command:
                 return f"Permission denied by deny list: {pattern}"
         if any(keyword in command for keyword in DESTRUCTIVE):
             if not prompt_user:
                 return "Permission required: ask Lead to run this command."
-            print(f"\n[permission] {block.name}({block.input})")
+            print(f"\n[权限确认] {tool_name}({arguments})")
             if input("Allow? [y/N] ").strip().lower() not in {"y", "yes"}:
                 return "Permission denied by user"
 
-    if block.name in {"read_file", "write_file", "edit_file"}:
-        raw_path = block.input.get("path", "")
+    if tool_name in {"read_file", "write_file", "edit_file"}:
+        raw_path = arguments.get("path", "")
         if not (WORKDIR / raw_path).resolve().is_relative_to(WORKDIR.resolve()):
             if not prompt_user:
                 return "Permission required: path is outside the workspace."
-            print(f"\n[permission] {block.name}({block.input})")
+            print(f"\n[权限确认] {tool_name}({arguments})")
             if input("Allow? [y/N] ").strip().lower() not in {"y", "yes"}:
                 return "Permission denied by user"
     return None
 
 
-def permission_hook(block):
-    return check_permission(block, prompt_user=True)
+def permission_hook(tool_name: str, arguments: dict):
+    return check_permission(tool_name, arguments, prompt_user=True)
 
 
-def log_hook(block):
-    preview = str(list(block.input.values())[:2])[:60]
-    print(f"[hook] {block.name}({preview})")
+def log_hook(tool_name: str, arguments: dict):
+    preview = str(list(arguments.values())[:2])[:60]
+    print(f"[hook] {tool_name}({preview})")
     return None
 
 
-def large_output_hook(block, output):
+def large_output_hook(tool_name: str, arguments: dict, output):
     if len(str(output)) > 100000:
-        print(f"[hook] Large output from {block.name}: {len(str(output))} chars")
+        print(f"[hook] {tool_name} 输出过大：{len(str(output))} 个字符")
     return None
 
 
@@ -1724,14 +1728,8 @@ def context_hook(query: str):
 
 def summary_hook(messages: list):
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for item in messages
+        if (item.get("type") if isinstance(item, dict) else getattr(item, "type", None)) == "function_call"
     )
     print(f"[hook] Stop: session used {tool_count} tool calls")
     return None
@@ -1744,18 +1742,18 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 
-def execute_tool(block) -> str:
-    blocked = trigger_hooks("PreToolUse", block)
+def execute_tool(tool_name: str, arguments: dict) -> str:
+    blocked = trigger_hooks("PreToolUse", tool_name, arguments)
     if blocked:
         return str(blocked)
-    handler = TOOL_HANDLERS.get(block.name)
+    handler = TOOL_HANDLERS.get(tool_name)
     if not handler:
-        return f"Unknown tool: {block.name}"
+        return f"错误：未知工具 {tool_name}"
     try:
-        output = str(handler(**block.input))
+        output = str(handler(**arguments))
     except Exception as exc:
-        output = f"Error: {type(exc).__name__}: {exc}"
-    trigger_hooks("PostToolUse", block, output)
+        output = f"错误：{type(exc).__name__}: {exc}"
+    trigger_hooks("PostToolUse", tool_name, arguments, output)
     return output
 
 
@@ -1764,45 +1762,38 @@ def execute_tool(block) -> str:
 def agent_loop(messages: list):
     while True:
         try:
-            response = client.messages.create(
+            response = client.responses.create(
                 model=MODEL,
-                system=SYSTEM,
-                messages=messages,
+                instructions=SYSTEM,
+                input=messages,
                 tools=TOOLS,
-                max_tokens=8000,
+                max_output_tokens=8000,
             )
         except Exception as exc:
-            messages.append({
-                "role": "assistant",
-                "content": [{
-                    "type": "text",
-                    "text": f"[Error] {type(exc).__name__}: {exc}",
-                }],
-            })
+            messages.append({"role": "user", "content": f"错误：{type(exc).__name__}: {exc}"})
             release_completed_assignment("agent")
             trigger_hooks("Stop", messages)
             return
 
-        messages.append({"role": "assistant", "content": response.content})
+        messages.extend(response.output)
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
             release_completed_assignment("agent")
             trigger_hooks("Stop", messages)
-            return
+            return response.output_text
 
-        results = []
-        for block in tool_calls:
-            print(f"> {block.name}")
-            output = execute_tool(block)
+        for tool_call in tool_calls:
+            arguments = json.loads(tool_call.arguments)
+            print(f"> {tool_call.name}")
+            output = execute_tool(tool_call.name, arguments)
             print(output[:300])
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+            messages.append({
+                "type": "function_call_output",
+                "call_id": tool_call.call_id,
+                "output": output,
             })
-        messages.append({"role": "user", "content": results})
 
 
 def print_last_assistant_message(history: list):

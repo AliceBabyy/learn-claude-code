@@ -40,17 +40,17 @@ MCP 把这部分拆成两个角色：server 提供工具列表和调用入口，
 def agent_loop(messages: list):
     while True:
         tools, handlers = assemble_tool_pool()
-        response = client.messages.create(
+        response = client.responses.create(
             model=MODEL,
-            system=assemble_system_prompt(),
-            messages=messages,
+            instructions=assemble_system_prompt(),
+            input=messages,
             tools=tools,
-            max_tokens=8000,
+            max_output_tokens=8000,
         )
         ...
 ```
 
-连接新 server 后，下一轮 `assemble_tool_pool()` 会把新工具加入模型输入。工具执行后，结果仍作为 `tool_result` 追加到 messages。
+连接新 server 后，下一轮 `assemble_tool_pool()` 会把新工具加入模型输入。模型返回的全部`response.output`会保留，工具执行结果作为带相同`call_id`的`function_call_output`追加到messages。
 
 ### 2. MCPClient 保存发现结果和调用入口
 
@@ -115,9 +115,10 @@ if prefixed in origins:
 
 ```python
 tools.append({
+    "type": "function",
     "name": prefixed,
     "description": tool_def.get("description", ""),
-    "input_schema": schema,
+    "parameters": schema,
 })
 handlers[prefixed] = (
     lambda *, client=server, tool=raw_name, **kwargs:
@@ -144,7 +145,7 @@ MCP_HOST_POLICY = {
 
 ### 7. 工具输入错误留在工具边界内
 
-模型可能漏传参数，也可能传入 server 不接受的字段。`execute_tool()` 和 `MCPClient.call_tool()` 都会捕获异常，并返回错误 `tool_result`：
+模型可能漏传参数，也可能传入 server 不接受的字段。`execute_tool()` 和 `MCPClient.call_tool()` 都会捕获异常，并返回错误`function_call_output`：
 
 ```text
 MCP error: TypeError: <lambda>() missing 1 required argument: 'query'

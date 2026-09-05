@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 try:
     import readline
 
-    readline.parse_and_bind("set bind-tty-special-chars off")
+    readline.parse_and_bind("set  bind-tty-special-chars off")
     readline.parse_and_bind("set input-meta on")
     readline.parse_and_bind("set output-meta on")
     readline.parse_and_bind("set convert-meta off")
@@ -43,7 +43,7 @@ if not MODEL:
     raise RuntimeError("缺少 OPENAI_MODEL_ID，请在项目根目录的 .env 中配置模型名称")
 
 # -- Memory store --
-
+# user用户偏好；feedback反馈意见；project项目事实；reference参考资料
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
 TEMPORARY_MEMORY_MARKERS = (
     "this session",
@@ -141,6 +141,10 @@ def should_store_memory(candidate: dict, existing: list[dict]) -> bool:
             return False
     return True
 
+# 格式化生成器，作用是将记忆信息统一存储格式
+# 1. 接收记忆的四个要素（名称、类型、描述、正文），拼接成一段标准格式文本
+# 2. 具体格式为：顶部是yaml格式元数据，下面是正文内容
+# 3. 这样一来，能把整个文件分为“头“和”身子“，需要的时候先看目录”头“再决定是否加载全文
 def memory_document(name: str, mem_type: str, description: str, body: str) -> str:
     metadata = yaml.safe_dump(
         {"name": name, "description": description, "type": mem_type},
@@ -149,6 +153,7 @@ def memory_document(name: str, mem_type: str, description: str, body: str) -> st
     ).strip()
     return f"---\n{metadata}\n---\n\n{body.strip()}\n"
 
+# 执行写入硬盘
 def write_memory_file(name: str, mem_type: str, description: str, body: str) -> Path:
     if not name.strip():
         raise ValueError("Memory name cannot be empty")
