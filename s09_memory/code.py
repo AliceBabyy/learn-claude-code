@@ -45,6 +45,8 @@ if not MODEL:
 # -- Memory store --
 # user用户偏好；feedback反馈意见；project项目事实；reference参考资料
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
+
+# 硬编码黑名单
 TEMPORARY_MEMORY_MARKERS = (
     "this session",
     "current session",
@@ -88,6 +90,8 @@ def memory_slug(name: str) -> str:
     slug = re.sub(r"[^\w]+", "-", name.lower()).strip("-_")
     return slug or "memory"
 
+# 获取文件路径
+# 接收文件名，找到该文件的绝对路径，返回绝对路径对象
 def memory_path(filename: str, allow_index: bool = False) -> Path:
     if Path(filename).name != filename:
         raise ValueError(f"Invalid memory filename: {filename}")
@@ -108,6 +112,8 @@ def _memory_slug(name: str) -> str:
 def _normalized_memory_text(value: str) -> str:
     return " ".join(value.lower().split())
 
+# 记忆存储准入审批 规则引擎
+# 分别接收一个候选、一个已有记忆列表，逐项检查是否符合存储条件，返回True或False
 def should_store_memory(candidate: dict, existing: list[dict]) -> bool:
     """Accept durable records that are not temporary or already stored."""
     if not isinstance(candidate, dict):
@@ -154,6 +160,9 @@ def memory_document(name: str, mem_type: str, description: str, body: str) -> st
     return f"---\n{metadata}\n---\n\n{body.strip()}\n"
 
 # 执行写入硬盘
+# 1. 接收四个参数：名称、类型、描述、正文。校验参数是否合法，按标准格式拼装起来
+# 2. 根据名称自动生成文件名，最后把文件写入内容
+# 3. 写入后，自动调用rebuild_memory_index()刷新目录索引
 def write_memory_file(name: str, mem_type: str, description: str, body: str) -> Path:
     if not name.strip():
         raise ValueError("Memory name cannot be empty")
@@ -168,6 +177,10 @@ def write_memory_file(name: str, mem_type: str, description: str, body: str) -> 
     rebuild_memory_index()
     return path
 
+# 目录索引刷新器
+# 1. 扫描.memory中所有.md文件
+# 2. 解析每个文件开头的yaml数据，提取名称和描述
+# 3. 将其整理成一条条列表项，覆盖写入MEMORY.md文件
 def rebuild_memory_index() -> None:
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
@@ -189,6 +202,8 @@ def rebuild_memory_index() -> None:
         "\n".join(lines) + ("\n" if lines else "")
     )
 
+# 目录文本读取
+# 读取目录文件MEMORY.md，返回纯文本字符串
 def read_memory_index() -> str:
     try:
         path = memory_path(MEMORY_INDEX.name, allow_index=True)
@@ -203,6 +218,7 @@ def read_memory_file(filename: str) -> str | None:
         return None
     return path.read_text() if path.is_file() else None
 
+# 扫描所有记忆文件，返回记忆目录（字典列表
 def list_memory_files() -> list[dict]:
     records = []
     if not MEMORY_DIR.exists():
@@ -286,8 +302,14 @@ def keyword_memory_selection(
     ranked.sort(key=lambda item: (-item[0], item[1]))
     return [filename for _, filename in ranked[:max_items]]
 
+# 记忆选择器
+# 1. 把整个记忆目录和用户最近问题拼成一条提示词，让模型直接返回相关记录的索引编号数组
+# 2. 当前一种方法失败时，降级到keyword_memory_selection，通过关键词筛选匹配。
+# 3. 返回结果：最后从已有记忆库中选出与当前用户问题最相关的记录，返回这些记录的文件名列表
 def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
+    # 调目录
     records = list_memory_files()
+    # 调用户问题
     query = recent_user_text(messages)
     if not records or not query:
         return []
@@ -304,6 +326,7 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
         f"Current request:\n{query}\n\nMemory catalog:\n{catalog[:12000]}"
     )
 
+    # 调模型
     try:
         response = client.responses.create(
             model=MODEL,
@@ -321,8 +344,16 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
                     break
         return selected
     except Exception:
+        # 关键词匹配兜底
         return keyword_memory_selection(records, query, max_items)
 
+# 记忆内容加载器
+# 1. 先调select_relevant_memories拿到需要加载的文件名列表
+# 2. 逐个加载这些记忆文件的完整content
+# 3. 读取时有两个约束：
+#     第一种，累加，但受字数限制，超出直接截断
+#     第二种，将加载的content打包成jason返回
+# 4. 将加载结果给build_system，由该方法将content嵌入系统提示词作文本轮对话背景
 def load_memories(messages: list) -> str:
     loaded = []
     remaining = RECALL_CHAR_LIMIT
@@ -336,7 +367,8 @@ def load_memories(messages: list) -> str:
     return json.dumps(loaded, ensure_ascii=False, indent=2) if loaded else ""
 
 def build_system(relevant_memories: str = "") -> str:
-    index = read_memory_index()
+    # 获取纯文本目录清单
+    index = read_memory_index() # 该方法内部会调用memory_path获取文件的绝对路径
     sections = [
         (
             f"You are a coding agent at {WORKDIR}. "
@@ -365,6 +397,7 @@ def dialogue_text(messages: list, max_messages: int = 12) -> str:
             lines.append(f"{message.get('role', 'unknown')}: {text}")
     return "\n".join(lines)[:8000]
 
+# 数据格式校验清洗，语法层面
 def validate_memory_record(
     record, require_scope: bool = False
 ) -> dict | None:
@@ -390,11 +423,14 @@ def validate_memory_record(
         validated["scope"] = scope
     return validated
 
+# 记忆提取
+# 把最近一段聊天记录发给ai，让其提炼哪些信息值得长期记住，校验保存
 def extract_memories(messages: list) -> int:
     dialogue = dialogue_text(messages)
     if not dialogue:
         return 0
 
+    #调目录，获取目录列表
     existing_records = list_memory_files()
     existing = "\n".join(
         f"- {record['name']}: {record['description']}"
@@ -416,6 +452,7 @@ def extract_memories(messages: list) -> int:
         f"Existing memory catalog:\n{existing[:6000]}\n\nDialogue:\n{dialogue}"
     )
 
+    # 调模型，提取应持久保存的记忆
     try:
         response = client.responses.create(
             model=MODEL,
@@ -426,6 +463,7 @@ def extract_memories(messages: list) -> int:
             validated
             for item in extract_json_array(response_text(response))
             if (
+                # 校验语法
                 validated := validate_memory_record(
                     item, require_scope=True
                 )
@@ -434,8 +472,10 @@ def extract_memories(messages: list) -> int:
 
         stored = 0
         for candidate in candidates:
+            # 调审批函数，校验语义（该方法中包含黑名单校验）
             if not should_store_memory(candidate, existing_records):
                 continue
+            # 语义、语法校验通过，存入硬盘文件
             write_memory_file(
                 candidate["name"],
                 candidate["type"],
@@ -452,8 +492,13 @@ def extract_memories(messages: list) -> int:
         print(f"\n\033[33m[Memory extraction skipped: {error}]\033[0m")
         return 0
 
+# 记忆压缩整理
+# 本地记忆超过10条的时候触发
+# 作用是：合并重复、修正冲突、淘汰过时信息，防止记忆库无限膨胀
 def consolidate_memories() -> int:
+    #调目录
     records = list_memory_files()
+    #校验记忆条数有没有超10条
     if len(records) < CONSOLIDATE_THRESHOLD:
         return 0
 
