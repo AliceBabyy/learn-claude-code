@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 try:
     import readline
@@ -169,9 +170,9 @@ class MCPClient:
     def __init__(self, name: str):
         self.name = name
         self.tools: list[dict] = []
-        self._handlers: dict[str, callable] = {}
+        self._handlers: dict[str, Callable[..., object]] = {}
 
-    def register(self, tool_defs: list[dict], handlers: dict[str, callable]):
+    def register(self, tool_defs: list[dict], handlers: dict[str, Callable[..., object]]):
         names = [tool.get("name") for tool in tool_defs]
         if any(not isinstance(name, str) or not name for name in names):
             raise ValueError("每个 MCP 工具都必须有非空名称")
@@ -317,7 +318,7 @@ BUILTIN_TOOLS = [*BASE_TOOLS, CONNECT_TOOL]
 BUILTIN_HANDLERS = {**BASE_HANDLERS, "connect_mcp": run_connect_mcp}
 
 
-def assemble_tool_pool() -> tuple[list[dict], dict[str, callable]]:
+def assemble_tool_pool() -> tuple[list[dict], dict[str, Callable[..., object]]]:
     """将内置工具与所有已连接服务端的工具合并。"""
     global mcp_tool_policies
     tools = list(BUILTIN_TOOLS)
@@ -452,7 +453,7 @@ register_hook("Stop", summary_hook)
 
 
 def execute_tool(
-    tool_name: str, arguments: dict, handlers: dict[str, callable]
+    tool_name: str, arguments: dict[str, object], handlers: dict[str, Callable[..., object]]
 ) -> str:
     blocked = trigger_hooks("PreToolUse", tool_name, arguments)
     if blocked:
