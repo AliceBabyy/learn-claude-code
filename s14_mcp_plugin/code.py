@@ -192,6 +192,7 @@ class MCPClient:
         self._handlers = dict(handlers)
 
     # 执行工具入口
+    # 接收handlers，获取对应的函数名称，执行，加几个异常兜底
     # 1. 接收工具的原始名字和参数。（如要执行mcp__docs__search时，其他函数会剥掉名字前缀只剩原始名字search，同参数一起传入此函数）
     # 2. 根据 tool_name 去 self.handlers 里找对应的函数，然后执行这个函数，返回结果字符串
     # 3. 如果找不到该工具或执行报错（如缺失参数），捕获异常返回 “MCP 错误：...” 然后让模型自己处理
@@ -213,6 +214,7 @@ mcp_tool_policies: dict[str, str] = {}
 
 _DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
+# 权限字典
 # 授权策略来自主机配置，绝不读取服务端描述来决定。
 MCP_HOST_POLICY = {
     ("docs", "search"): "allow",
@@ -302,16 +304,21 @@ MOCK_SERVERS = {
 
 # 制造一个MCP客户端
 # 根据名字找到对应的工厂，制造一个 MCPClient 并存于全局缓存，返回处理结果（纯字符串）
+# 0. 接收一个参数，name，这是服务端的名字
+# 1. 去全局字典找有没有同名客户端已连接的，避免重复
+# 2. 去总的模拟服务端的地方按参数name找这个工具名字对应的工厂函数，工厂函数会返回一个mcp客户端实例对象，赋值给server
+# 3. 最后再把这个mcp客户端实例对象对应其名字追加到mcp_clients
 def connect_mcp(name: str) -> str:
     # 去全局字典mcp_clients找有没有同名的，有的话return，避免重复加载
     if name in mcp_clients:
         return f"MCP 服务端“{name}”已连接"
-    # 查找工厂，去MOCK_SERVERS按name找工厂函数，会返回一个MCP客户端对象赋值给factory
-    factory = MOCK_SERVERS.get(name)
+    # 查找工厂，去MOCK_SERVERS按name找工厂函数
+    factory = MOCK_SERVERS.get(name) # 在这里，最后factory得到的应该是一个工厂函数的名字
     if not factory:
         return f"未知服务端“{name}”。可用服务端：{', '.join(MOCK_SERVERS)}"
+    # 这里factory（）才是真正的去调用了这个工厂函数，工厂函数会返回一个mcp客户端实例对象给server
     server = factory()
-    # 把该对象存入mcp_clients
+    # 把该对象存入mcp_clients。name是服务端名字，把刚刚弄好的mcp客户端实例对象存进去，对应key是服务端名称
     mcp_clients[name] = server
     names = ", ".join(tool["name"] for tool in server.tools)
     print(f"  [MCP] 已连接：{name} -> {names}")
@@ -324,7 +331,7 @@ def connect_mcp(name: str) -> str:
 def run_connect_mcp(name: str) -> str:
     return connect_mcp(name)
 
-
+# 包含的是一个创建mcp客户端对象并将其追加到mcp_client的方法的元数据，采用嵌套字典格式
 CONNECT_TOOL = {
     "type": "function",
     "name": "connect_mcp",
@@ -336,29 +343,38 @@ CONNECT_TOOL = {
     },
 }
 
+# BUILTIN_TOOLS 和 BUILTIN_HANDLERS 的区别可以说是：
+# 前者是工具的详细参数元数据，是给模型看的
+# 后者是真正干活的函数name映射，是给程序看的
+
+# 基础工具，BASE_TOOLS包含所有基础工具配置，包括工具名称的、函数名、描述等属性，为嵌套字典结构
+# CONNECT_TOOL是连接工具，包含了一个创建mcp客户端对象并将其追加到mcp_client的方法的元数据，采用嵌套字典格式
 BUILTIN_TOOLS = [*BASE_TOOLS, CONNECT_TOOL]
+
+# BASE_HANDLERS可以看做是工具目录，仅包含工具名称的和对应函数名称，本程序一共五个工具，在这里解包；
+# 再追加一个链接mcp的工具
+# 加起来应该是6个工具
 BUILTIN_HANDLERS = {**BASE_HANDLERS, "connect_mcp": run_connect_mcp}
 
 # 动态打包当前回合所有可用工具
-# 返回参数：tools，发给模型的工具定义列表；handlers，本地执行函数字典
+# 返回参数是打包更新好最新的tools和handlers：tools，发给模型的工具定义列表；handlers，本地执行函数字典
 # 1. 先复制一份 BUILTIN_TOOLS 和 BUILTIN_HANDLERS ，这是已有的 tools 和 handlers
 # 2. 在遍历已连接的：遍历mcp_clients，对每个服务端的每个工具做加名字前缀规范、冲突检查、把新名字放入tools，对应执行入库放入handlers
 # 3. 打包返回：元组（tools，handlers）
 def assemble_tool_pool() -> tuple[list[dict], dict[str, Callable[..., object]]]:
     """将内置工具与所有已连接服务端的工具合并。"""
     global mcp_tool_policies
-    tools = list(BUILTIN_TOOLS)
+    tools = list(BUILTIN_TOOLS) # BUILTIN_TOOLS的键值是（base工具，mcp连接工具）
     handlers = dict(BUILTIN_HANDLERS)
     policies: dict[str, str] = {}
     origins = {
-        tool["name"]: f"内置工具 {tool['name']!r}"
-        for tool in tools
+        tool["name"]: f"内置工具 {tool['name']!r}" for tool in tools
     }
-
-    for server_name, server in mcp_clients.items():
+    for server_name, server in mcp_clients.items(): # mcp_clients中 (key：value) = (服务端名称：MCPClient实例)
         safe_server = normalize_mcp_name(server_name)
-        for tool_def in server.tools:
+        for tool_def in server.tools: # server 是 MCPClient 实例，把MCP客户端的实例对象中的工具tools拿出来
             raw_name = tool_def["name"]
+            # 这些都是关于工具名称的规范校验和兜底-----------------
             safe_tool = normalize_mcp_name(raw_name)
             prefixed = f"mcp__{safe_server}__{safe_tool}"
             if len(prefixed) > 64:
@@ -373,6 +389,8 @@ def assemble_tool_pool() -> tuple[list[dict], dict[str, Callable[..., object]]]:
             if not isinstance(schema, dict) or schema.get("type", "object") != "object":
                 raise ValueError(f"{origin} 的输入 schema 无效")
             origins[prefixed] = origin
+            # ------------------------
+            #追加工具,将新的工具追加到tools，是基于（base工具，mcp连接工具）外的新的工具，这个新的工具是从mcp_client中取出来的
             tools.append({
                 "type": "function",
                 "name": prefixed,
@@ -478,8 +496,7 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 # 所有工具调用的统一执行入口
-def execute_tool(
-    tool_name: str, arguments: dict[str, object], handlers: dict[str, Callable[..., object]]
+def execute_tool(tool_name: str, arguments: dict[str, object], handlers: dict[str, Callable[..., object]]
 ) -> str:
     blocked = trigger_hooks("PreToolUse", tool_name, arguments)
     if blocked:
@@ -501,11 +518,12 @@ def agent_loop(messages: list):
     round_number = 0
     while True:
         try:
-            # 获取当前可用工具池
+            # 1. 每轮循环开始先组装工具池获取当前可用工具池，把这轮所有能用的工具准备好，并且打印出来给用户看
             tools, handlers = assemble_tool_pool()
             round_number += 1
             # 用生成器表达式把tool的name全部取出来放到一个列表，再转化成字符串，每个name用逗号进行连接，赋值给tool_names，是字符串格式
             tool_names = ", ".join(tool["name"] for tool in tools)
+
             print(f"当前轮次：{round_number}")
             print(f"本轮工具池：{tool_names}")
             # 调模型
@@ -527,6 +545,8 @@ def agent_loop(messages: list):
         # 保留消息、推理项和函数调用等全部输出，供下一轮完整回传。
         messages.extend(response.output) # 把所有output追加到消息
 
+        # 调工具
+        # 收集所有工具函数调用
         tool_calls = [
             item for item in response.output if item.type == "function_call"
         ]
@@ -534,6 +554,7 @@ def agent_loop(messages: list):
             trigger_hooks("Stop", messages)
             return response.output_text
 
+        # 循环遍历执行工具函数
         for tool_call in tool_calls:
             print(f"> {tool_call.name}")
             arguments = json.loads(tool_call.arguments)
